@@ -207,23 +207,39 @@ local function room_post(event, name, action)
         log_event(actor, "subject", name, "", (tostring(before) .. " -> " .. subject));
         return reply(200, { ok = true, room = name, subject = subject, before = before });
     elseif action == "kick" then
-        -- Attempted and REFUTED on this build (stable-11248, Prosody 13):
-        -- room:set_role(actor, nick, "none") returns without error for every
-        -- actor form (human moderator occupant, focus JID, nil, true) and the
-        -- occupant stays in the room. Jitsi's MUC keeps SIP/Jigasi occupants
-        -- under Jicofo's control, so a server-side role change is ignored.
-        -- Refusing beats returning a success that does nothing.
-        log_event(actor, "kick-unsupported", name, body.nick or "", "set_role has no effect on this build");
-        return reply(501, {
-            error = "kick is not effective through the Prosody module on this build",
-            evidence = "room:set_role(actor|nil|true, nick, 'none') reports ok and the occupant remains",
-            detail = "Jitsi keeps Jigasi/SIP occupants under Jicofo's control; MUC role changes are ignored",
-            alternatives = {
-                "join a real XMPP moderator seat and issue muc#admin IQs",
-                "terminate the conference from Jicofo (drops everyone)",
-                "end the SIP leg on the bot side (fs_cli uuid_kill on FreeSWITCH)",
-            },
-        });
+        -- set_role is ignored on this build (see skill), but set_affiliation IS
+        -- honored. A kick is therefore: affiliation outcast (removes + bans), then
+        -- restore the affiliation a moment later so it is a removal, not a ban.
+        local nick = body.nick;
+        if type(nick) ~= "string" then return reply(400, { error = "nick (string) required" }) end
+        local target, prior = nil, nil;
+        for key, o in room:each_occupant() do
+            local n = tostring(key):match("/(.+)$") or tostring(key);
+            if n == nick then target, prior = o, o.affiliation end
+        end
+        if not target then return reply(404, { error = "no such occupant", nick = nick }) end
+        local jid = target.jid;
+        if not jid or jid == "" then return reply(500, { error = "occupant has no jid" }) end
+
+        local ok = pcall(function() room:set_affiliation(true, jid, "outcast") end);
+        if not ok then return reply(500, { error = "set_affiliation(outcast) failed" }) end
+
+        -- restore so the person is removed, not permanently banned
+        module:add_timer(3, function()
+            pcall(function() room:set_affiliation(true, jid, prior == "owner" and "none" or "none") end);
+        end);
+
+        local still = false;
+        for key in room:each_occupant() do
+            local n = tostring(key):match("/(.+)$") or tostring(key);
+            if n == nick then still = true end
+        end
+        log_event(actor, "kick", name, nick, "affiliation " .. tostring(prior) .. " -> outcast -> none; removed=" .. tostring(not still));
+        if still then
+            return reply(409, { error = "occupant still present after affiliation change", nick = nick });
+        end
+        return reply(200, { ok = true, room = name, kicked = nick, jid = jid,
+                            mechanism = "affiliation outcast, restored to none after 3s" });
     elseif action == "mute" then
         log_event(actor, "mute-refused", name, body.nick or "", "server cannot enforce client mute");
         return reply(501, {

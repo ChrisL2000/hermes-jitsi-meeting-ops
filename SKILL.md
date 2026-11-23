@@ -62,20 +62,39 @@ that also holds a microphone.
     POST /ctl/room/<room>/kick       → 501 NOT SUPPORTED on this build (see below)
     POST /ctl/room/<room>/mute       → 501 BY DESIGN
 
-### Kick/mute: measured limits, not guesses
+### Kick: WORKS via affiliation (verified 2026-11-23)
 
-`room:set_role(actor, nick, "none")` returns WITHOUT error for every actor form
-(human moderator occupant JID, focus JID, `nil`, `true`) and the occupant stays in
-the room. A probe endpoint tried all four in one request: all reported ok, none
-removed anybody. Jitsi keeps SIP/Jigasi occupants under Jicofo's control, so a
-MUC-level role change is ignored.
+`set_role` is ignored, but `set_affiliation(true, jid, "outcast")` IS honored — it
+removes the occupant immediately and the role snapshot confirms it. So kick =
+affiliation `outcast`, then a 3-second `module:add_timer` restores affiliation to
+`none`, making it a removal rather than a permanent ban. Verified end to end: the
+kicked Jigasi participant disappeared from the roster, the conference ended when
+the room emptied, and the audit line recorded
+`affiliation participant -> outcast -> none; removed=true`.
 
-The module now returns 501 with that evidence instead of a fake 200. Working
-alternatives: join a real XMPP moderator seat and send muc#admin IQs; terminate the
-conference from Jicofo (drops everyone); or end the SIP leg on the bot side
-(`fs_cli uuid_kill`).
+Known asymmetry to respect: the actor form matters. `set_affiliation(true, …)`
+(server identity) works; `set_affiliation(occupant, …)` fails with "Unable to
+identify actor session from context".
 
-Mute is refused for the same class of reason: audio state lives in the client.
+### Mute: 501 by design
+
+Jitsi enforces audio state in the participant's client, so a server-side mute is a
+request the client may ignore. Refusing beats a false 200.
+
+### Ops seat (v0.2, partial)
+
+A real XMPP moderator seat exists as an alternative to affiliation tricks:
+account `ops@meet.jitsi`, password at
+`/root/.jitsi-meet-cfg/prosody/config/jitsi-ctl/ops.pass`, client
+`~/ops-seat/ops_seat.py` (slixmpp 1.12 in `~/ops-seat/venv` on the Jitsi host).
+The seat is made a genuine moderator with
+`POST /ctl/room/<room>/grant_jid {"jid":"ops@meet.jitsi","affiliation":"owner"}` —
+verified, it flips the seat to role=moderator.
+
+BLOCKER: slixmpp 1.12 STARTTLS. It receives `<starttls><required/>`, sends the
+request, and Prosody closes the stream before the handshake finishes even with
+`ssl_context.check_hostname=False` / `CERT_NONE` (slixmpp rebuilds its context
+internally). Fix is a subclassed `get_ssl_context` or an explicit CA pin.
 
 ### Roster field quirks (this build)
 
