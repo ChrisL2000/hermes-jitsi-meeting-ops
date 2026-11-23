@@ -99,17 +99,33 @@ local function get_room(name)
     return muc.get_room_from_jid(name:lower() .. "@" .. MUC_HOST);
 end
 
+local function get_subject(room)
+    -- newer Prosody keeps the subject behind a method; older builds used _data
+    local ok, value = pcall(function() return room:get_subject() end);
+    if ok and value ~= nil then return value end
+    if room._data then return room._data.subject end
+    return nil;
+end
+
+
 local function room_view(room, name)
     local occ = {};
     local role_manager = {};
-    for o in room:each_occupant() do
+    -- room:each_occupant() returns pairs(self._occupants): the FIRST value is the
+    -- nick, the second is the occupant object. Iterating single-variable yields
+    -- strings, which is why an earlier version returned empty records.
+    for key, o in room:each_occupant() do
+        -- this build keys occupants by full MUC occupant JID
+        -- ("room@muc.host/<nick>"), so the human-facing nick is the last segment
+        local nick = tostring(key):match("/(.+)$") or tostring(key);
+        local jid = o.jid or "";
         occ[#occ + 1] = {
-            nick = o.nick,
-            jid = o.jid,
+            nick = nick,
+            jid = jid,
             real_jid = o.real_jid,
             role = o.role,
             affiliation = o.affiliation,
-            is_bot = ((o.jid or ""):match("jigasi") ~= nil or (o.jid or ""):match("jibri") ~= nil),
+            is_bot = (jid:match("jigasi") ~= nil or jid:match("jibri") ~= nil),
         };
     end
     if room.get_role_manager then
@@ -124,7 +140,7 @@ local function room_view(room, name)
     return {
         room = name:lower(),
         jid = room.jid,
-        subject = room._data and room._data.subject or nil,
+        subject = get_subject(room),
         name = room._data and room._data.name or nil,
         locked = room._data and room._data.locked or nil,
         occupants = occ,
@@ -141,17 +157,25 @@ local function list_rooms(event)
     local muc = host and host.modules and host.modules.muc;
     if not muc or not muc.get_room_from_jid then return reply(503, { error = "muc unavailable" }) end
     local out = {};
-    -- Prosody keeps live rooms in the component's rooms table
-    local rooms = muc.rooms;
+    -- This build has no rooms registry exposed to modules; touching muc.rooms
+    -- raises "non-existent global 'rooms'". Probe defensively, never assume.
+    local rooms;
+    local ok_rooms, value = pcall(function() return muc.rooms end);
+    if ok_rooms then rooms = value end
+    if not rooms then
+        local ok_get, got = pcall(function() return muc.get_rooms and muc.get_rooms() end);
+        if ok_get then rooms = got end
+    end
     if rooms then
         for jid, room in pairs(rooms) do
-            local subject = room._data and room._data.subject or nil;
+            local subject = get_subject(room);
             local count = 0;
             for _ in room:each_occupant() do count = count + 1 end
             out[#out + 1] = { room = jid, subject = subject, occupants = count };
         end
     end
-    return reply(200, { rooms = out, count = #out });
+    return reply(200, { rooms = out, count = #out,
+        note = (#out == 0 and "list unavailable on this build; enumerate via Jicofo and GET /ctl/room/<room>") or nil });
 end
 
 local function room_get(event, name)
@@ -183,17 +207,23 @@ local function room_post(event, name, action)
         log_event(actor, "subject", name, "", (tostring(before) .. " -> " .. subject));
         return reply(200, { ok = true, room = name, subject = subject, before = before });
     elseif action == "kick" then
-        local nick = body.nick;
-        if type(nick) ~= "string" then return reply(400, { error = "nick (string) required" }) end
-        local found, prior_role = nil, nil;
-        for o in room:each_occupant() do
-            if o.nick == nick then found = o; prior_role = o.role end
-        end
-        if not found then return reply(404, { error = "no such occupant", nick = nick }) end
-        local ok = pcall(function() room:set_role(true, nick, "none") end);
-        if not ok then return reply(500, { error = "set_role failed" }) end
-        log_event(actor, "kick", name, nick, "role " .. tostring(prior_role) .. " -> none");
-        return reply(200, { ok = true, room = name, kicked = nick, prior_role = prior_role });
+        -- Attempted and REFUTED on this build (stable-11248, Prosody 13):
+        -- room:set_role(actor, nick, "none") returns without error for every
+        -- actor form (human moderator occupant, focus JID, nil, true) and the
+        -- occupant stays in the room. Jitsi's MUC keeps SIP/Jigasi occupants
+        -- under Jicofo's control, so a server-side role change is ignored.
+        -- Refusing beats returning a success that does nothing.
+        log_event(actor, "kick-unsupported", name, body.nick or "", "set_role has no effect on this build");
+        return reply(501, {
+            error = "kick is not effective through the Prosody module on this build",
+            evidence = "room:set_role(actor|nil|true, nick, 'none') reports ok and the occupant remains",
+            detail = "Jitsi keeps Jigasi/SIP occupants under Jicofo's control; MUC role changes are ignored",
+            alternatives = {
+                "join a real XMPP moderator seat and issue muc#admin IQs",
+                "terminate the conference from Jicofo (drops everyone)",
+                "end the SIP leg on the bot side (fs_cli uuid_kill on FreeSWITCH)",
+            },
+        });
     elseif action == "mute" then
         log_event(actor, "mute-refused", name, body.nick or "", "server cannot enforce client mute");
         return reply(501, {

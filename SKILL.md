@@ -54,17 +54,41 @@ that also holds a microphone.
 | audit | `/root/.jitsi-meet-cfg/prosody/config/jitsi-ctl/audit.jsonl` (append-only) |
 | client | `~/src/jitsi-hermes-bot/bot/meeting_ctl.py`, token copied to `~/.hermes/jitsi-ctl-token` (600) |
 
-## API (v0.1)
+## API (v0.1) — verified against a live room 2026-11-23
 
-    GET  /ctl/rooms                  {"rooms":[{room,subject,occupants}],"count":N}
+    GET  /ctl/rooms                  {"rooms":[...],"count":N,"source":"jicofo+ctl"}
     GET  /ctl/room/<room>            subject, locked, occupants[{nick,jid,real_jid,role,affiliation,is_bot}]
-    POST /ctl/room/<room>/subject    {"subject":"..."}
-    POST /ctl/room/<room>/kick       {"nick":"..."}      role -> none
-    POST /ctl/room/<room>/mute       -> 501 BY DESIGN
+    POST /ctl/room/<room>/subject    {"subject":"..."}   VERIFIED: sets and reads back
+    POST /ctl/room/<room>/kick       → 501 NOT SUPPORTED on this build (see below)
+    POST /ctl/room/<room>/mute       → 501 BY DESIGN
 
-Mute is refused on purpose: Jitsi audio state is enforced in the participant's
-client, so a server-side mute would be a request the client may ignore. Returning
-200 there would be a lie. Kick is the enforceable action.
+### Kick/mute: measured limits, not guesses
+
+`room:set_role(actor, nick, "none")` returns WITHOUT error for every actor form
+(human moderator occupant JID, focus JID, `nil`, `true`) and the occupant stays in
+the room. A probe endpoint tried all four in one request: all reported ok, none
+removed anybody. Jitsi keeps SIP/Jigasi occupants under Jicofo's control, so a
+MUC-level role change is ignored.
+
+The module now returns 501 with that evidence instead of a fake 200. Working
+alternatives: join a real XMPP moderator seat and send muc#admin IQs; terminate the
+conference from Jicofo (drops everyone); or end the SIP leg on the bot side
+(`fs_cli uuid_kill`).
+
+Mute is refused for the same class of reason: audio state lives in the client.
+
+### Roster field quirks (this build)
+
+- `room:each_occupant()` yields PAIRS keyed by the full occupant JID
+  (`room@muc.host/<nick>`); iterating one variable gives strings, not occupants.
+  The nick is the last path segment.
+- The subject is behind `room:get_subject()`; `room._data.subject` alone returns nil
+  even after a successful rename.
+- There is no live-room registry exposed to modules — reading `muc.rooms` raises
+  "Attempt to read a non-existent global 'rooms'". `/ctl/rooms` reports empty and the
+  client enumerates via Jicofo + one GET per room.
+- `is_bot` is heuristic (MUC JID contains jigasi/jibri); Jigasi guests show as
+  ordinary UUID JIDs, so a SIP bot can appear as `participant` with is_bot=false.
 
 ## Auth (both required, fail-closed)
 
@@ -106,6 +130,17 @@ collector in the SIP bot.
 
 A Prosody recreate DROPS every live conference — schedule it, and expect clients
 to re-enter the room.
+
+### Reload WITHOUT dropping the room (use this after the first deploy)
+
+    ssh chrismok@100.83.185.118 \
+      'sudo docker exec jitsi-migrate-11248-prosody-1 prosodyctl \
+        --config /run/prosody/config/prosody.cfg.lua shell module reload meeting_ctl meet.jitsi'
+
+Output `Reloaded on meet.jitsi` / `OK: Module reloaded on 1 host`. Zig-zagging with
+`docker compose ... --force-recreate prosody` while iterating kicks every participant
+and looks exactly like "the room is crashing on join". Recreate only to change
+`.env`/GLOBAL_MODULES.
 
 ## Gotchas (each cost a deploy cycle)
 

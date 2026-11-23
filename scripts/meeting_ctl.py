@@ -71,6 +71,20 @@ def _call(method, path, body=None):
     return code, data
 
 
+def _jicofo_rooms():
+    remote = ("sudo docker exec jitsi-migrate-11248-jicofo-1 "
+              "curl -s localhost:8888/debug/conferences")
+    r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+                        SSH_TARGET, remote], capture_output=True, text=True, timeout=20)
+    if r.returncode != 0 or not r.stdout.strip():
+        return []
+    try:
+        jids = json.loads(r.stdout)
+    except Exception:
+        return []
+    return [j.split("@")[0] for j in jids if isinstance(j, str)]
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -79,6 +93,15 @@ def main():
 
     if cmd == "rooms":
         code, data = _call("GET", "/ctl/rooms")
+        # This Prosody build does not expose a live-room registry to modules, so
+        # fall back to Jicofo (authoritative list) + one GET per room.
+        if str(code).startswith("2") and not data.get("rooms"):
+            names = _jicofo_rooms()
+            rooms = []
+            for name in names:
+                _, detail = _call("GET", f"/ctl/room/{urllib.parse.quote(name, safe='')}")
+                rooms.append(detail)
+            data = {"rooms": rooms, "count": len(rooms), "source": "jicofo+ctl"}
     elif cmd == "room":
         room = urllib.parse.quote(sys.argv[2].lower(), safe="")
         code, data = _call("GET", f"/ctl/room/{room}")
